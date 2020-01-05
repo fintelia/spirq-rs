@@ -1,5 +1,11 @@
 # Change Log
 
+## v0.2.2
+
+- Fixed that multiple calls to a same function would lead to errors ([#7](https://github.com/PENGUINLIONG/spirq-rs/issues/7)); 
+- Fixed that interface variable location aliasing is not allowed;
+- Added descriptive information to errors ([#7](https://github.com/PENGUINLIONG/spirq-rs/issues/7)).
+
 ## v0.2.1
 
 - Fixed a typo (`InputAtatchment`);
