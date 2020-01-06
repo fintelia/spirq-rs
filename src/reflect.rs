@@ -4,11 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::iter::Peekable;
 use std::ops::RangeInclusive;
 use spirv_headers::{Decoration, Dim, StorageClass};
+use crate::{
+    Location, DescriptorBinding, SpirvBinary, Instrs, Instr, Manifest,
+    ResourceLocator, ExecutionModel, EntryPoint
+};
+use crate::error::{Error, Result};
 use crate::ty::*;
 use crate::consts::*;
-use crate::{Location, DescriptorBinding, SpirvBinary, Instrs, Instr, Manifest,
-    ResourceLocator, ExecutionModel, EntryPoint};
-use crate::error::{Error, Result};
 use crate::instr::*;
 
 // Intermediate types used in reflection.
@@ -143,134 +145,171 @@ impl<'a> ReflectIntermediate<'a> {
         }
         Ok(())
     }
+    fn populate_bool_ty(&mut self, instr: &Instr<'a>) -> Result<(TypeId, Type)> {
+        let op = OpTypeBool::try_from(instr)?;
+        let scalar_ty = ScalarType::boolean();
+        Ok((op.ty_id, Type::Scalar(scalar_ty)))
+    }
+    fn populate_int_ty(&mut self, instr: &Instr<'a>) -> Result<(TypeId, Type)> {
+        let op = OpTypeInt::try_from(instr)?;
+        let scalar_ty = ScalarType::int(op.nbyte >> 3, op.is_signed);
+        Ok((op.ty_id, Type::Scalar(scalar_ty)))
+    }
+    fn populate_float_ty(&mut self, instr: &Instr<'a>) -> Result<(TypeId, Type)> {
+        let op = OpTypeFloat::try_from(instr)?;
+        let scalar_ty = ScalarType::float(op.nbyte >> 3);
+        Ok((op.ty_id, Type::Scalar(scalar_ty)))
+    }
+    fn populate_vec_ty(&mut self, instr: &Instr<'a>) -> Result<(TypeId, Type)> {
+        let op = OpTypeVector::try_from(instr)?;
+        if let Some(Type::Scalar(scalar_ty)) = self.ty_map.get(&op.scalar_ty_id) {
+            let vec_ty = VectorType::new(scalar_ty.clone(), op.nscalar);
+            Ok((op.ty_id, Type::Vector(vec_ty)))
+        } else {
+            Err(Error::TY_NOT_FOUND)
+        }
+    }
+    fn populate_mat_ty(&mut self, instr: &Instr<'a>) -> Result<(TypeId, Type)> {
+        let op = OpTypeMatrix::try_from(instr)?;
+        if let Some(Type::Vector(vec_ty)) = self.ty_map.get(&op.vec_ty_id) {
+            let mat_ty = MatrixType::new(vec_ty.clone(), op.nvec);
+            Ok((op.ty_id, Type::Matrix(mat_ty)))
+        } else {
+            Err(Error::TY_NOT_FOUND)
+        }
+    }
+    fn populate_img_ty(&mut self, instr: &Instr<'a>) -> Result<(TypeId, Type)> {
+        let op = OpTypeImage::try_from(instr)?;
+        if op.dim == Dim::DimSubpassData {
+            Ok((op.ty_id, Type::SubpassData))
+        } else {
+            // Only unit types allowed to be stored in storage images can
+            // have given format.
+            let unit_fmt = ImageUnitFormat::from_spv_def(op.is_sampled, op.is_depth, op.color_fmt)?;
+            let arng = ImageArrangement::from_spv_def(op.dim, op.is_array, op.is_multisampled)?;
+            let img_ty = ImageType::new(unit_fmt, arng);
+            Ok((op.ty_id, Type::Image(img_ty)))
+        }
+    }
+    fn populate_sampled_img_ty(&mut self, instr: &Instr<'a>) -> Result<(TypeId, Type)> {
+        let op = OpTypeSampledImage::try_from(instr)?;
+        if let Some(Type::Image(img_ty)) = self.ty_map.get(&op.img_ty_id) {
+            Ok((op.ty_id, Type::Image(img_ty.clone())))
+        } else {
+            Err(Error::TY_NOT_FOUND)
+        }
+    }
+    fn populate_arr_ty(&mut self, instr: &Instr<'a>) -> Result<(TypeId, Type)> {
+        let op = OpTypeArray::try_from(instr)?;
+        let proto_ty = self.ty_map.get(&op.proto_ty_id)
+            .ok_or(Error::TY_NOT_FOUND)?;
+        let nrepeat = self.const_map.get(&op.nrepeat_const_id)
+            .and_then(|constant| {
+                if let Some(Type::Scalar(scalar_ty)) = self.ty_map.get(&constant.ty) {
+                    if scalar_ty.nbyte() == 4 && scalar_ty.is_uint() {
+                        return Some(constant.value[0]);
+                    }
+                }
+                None
+            })
+            .ok_or(Error::CONST_NOT_FOUND)?;
+        let stride = self.get_deco_u32(op.ty_id, None, Decoration::ArrayStride);
+        let arr_ty = if let Some(stride) = stride {
+            ArrayType::new(proto_ty, nrepeat, stride as usize)
+        } else {
+            ArrayType::new_multibind(proto_ty, nrepeat)
+        };
+        Ok((op.ty_id, Type::Array(arr_ty)))
+    }
+    fn populate_rt_arr_ty(&mut self, instr: &Instr<'a>) -> Result<(TypeId, Type)> {
+        let op = OpTypeRuntimeArray::try_from(instr)?;
+        let proto_ty = self.ty_map.get(&op.proto_ty_id)
+            .ok_or(Error::TY_NOT_FOUND)?;
+        let stride = self.get_deco_u32(op.ty_id, None, Decoration::ArrayStride)
+            .ok_or(Error::MISSING_DECO)?;
+        let arr_ty = ArrayType::new_unsized(proto_ty, stride as usize);
+        Ok((op.ty_id, Type::Array(arr_ty)))
+    }
+    // There might be some special decoration on struct members so we have to
+    // elaborate the details deriving member types from the templates.
+    fn elab_struct_member_ty(
+        &self,
+        ty_id: TypeId,
+        member_idx: u32,
+        member_ty_id: TypeId,
+    ) -> Result<Type> {
+        let i = member_idx;
+        let mut member_ty = self.ty_map.get(&member_ty_id)
+            .cloned()
+            .ok_or(Error::TY_NOT_FOUND)?;
+
+        // A matrix struct member must be decorated with stride and axis order.
+        let mut proto_ty = &mut member_ty;
+        while let Type::Array(arr_ty) = proto_ty {
+            proto_ty = &mut *arr_ty.proto_ty;
+        }
+        if let Type::Matrix(ref mut mat_ty) = proto_ty {
+            let mat_stride = self.get_deco_u32(ty_id, Some(i), Decoration::MatrixStride)
+                .ok_or(Error::MISSING_DECO)?;
+            let row_major = self.contains_deco(ty_id, Some(i), Decoration::RowMajor);
+            let col_major = self.contains_deco(ty_id, Some(i), Decoration::ColMajor);
+            let major = match (row_major, col_major) {
+                (true, false) => MatrixAxisOrder::RowMajor,
+                (false, true) => MatrixAxisOrder::ColumnMajor,
+                _ => return Err(Error::MAT_AXIS_ORDER),
+            };
+            mat_ty.decorate(mat_stride as usize, major);
+        }
+
+        Ok(member_ty)
+    }
+    fn populate_struct_ty(&mut self, instr: &Instr<'a>) -> Result<Option<(TypeId, Type)>> {
+        let op = OpTypeStruct::try_from(instr)?;
+        let ty_id = op.ty_id;
+        let mut struct_ty = StructType::default();
+        for (i, &member_ty_id) in op.member_ty_ids.iter().enumerate() {
+            let i = i as u32;
+            let member_ty = self.elab_struct_member_ty(ty_id, i, member_ty_id)?;
+            if let Some(offset) = self.get_deco_u32(ty_id, Some(i), Decoration::Offset) {
+                let name = self.get_name(ty_id, Some(i))
+                    .and_then(|x| if x.is_empty() { None } else { Some(x.to_owned()) });
+                let member = StructMember {
+                    name,
+                    offset: offset as usize,
+                    ty: member_ty,
+                };
+                struct_ty.push_member(member)?;
+            } else {
+                // For shader input/output blocks there are no offset
+                // decoration. Since these variables are not externally
+                // accessible we don't have to worry about them. For example,
+                // the input interface of a vertex shader cannot have a block.
+                // Input/ouput structs in HLSL will be flattened compiling to
+                // SPIR-V.
+                return Ok(None);
+            }
+        }
+        // Don't have to shrink-to-fit because the types in `ty_map`
+        // won't be used directly and will be cloned later.
+        Ok(Some((op.ty_id, Type::Struct(struct_ty))))
+    }
     fn populate_one_ty(&mut self, instr: &Instr<'a>) -> Result<()> {
         use std::collections::hash_map::Entry::Vacant;
         let (key, value) = match instr.opcode() {
-            OP_TYPE_VOID | OP_TYPE_FUNCTION => { return Ok(()) },
-            OP_TYPE_BOOL => {
-                let op = OpTypeBool::try_from(instr)?;
-                let scalar_ty = ScalarType::boolean();
-                (op.ty_id, Type::Scalar(scalar_ty))
-            },
-            OP_TYPE_INT => {
-                let op = OpTypeInt::try_from(instr)?;
-                let scalar_ty = ScalarType::int(op.nbyte >> 3, op.is_signed);
-                (op.ty_id, Type::Scalar(scalar_ty))
-            }
-            OP_TYPE_FLOAT => {
-                let op = OpTypeFloat::try_from(instr)?;
-                let scalar_ty = ScalarType::float(op.nbyte >> 3);
-                (op.ty_id, Type::Scalar(scalar_ty))
-            },
-            OP_TYPE_VECTOR => {
-                let op = OpTypeVector::try_from(instr)?;
-                if let Some(Type::Scalar(scalar_ty)) = self.ty_map.get(&op.scalar_ty_id).cloned() {
-                    let vec_ty = VectorType::new(scalar_ty, op.nscalar);
-                    (op.ty_id, Type::Vector(vec_ty))
-                } else { return Err(Error::TY_NOT_FOUND); }
-            },
-            OP_TYPE_MATRIX => {
-                let op = OpTypeMatrix::try_from(instr)?;
-                if let Some(Type::Vector(vec_ty)) = self.ty_map.get(&op.vec_ty_id).cloned() {
-                    let mat_ty = MatrixType::new(vec_ty, op.nvec);
-                    (op.ty_id, Type::Matrix(mat_ty))
-                } else { return Err(Error::TY_NOT_FOUND); }
-            },
-            OP_TYPE_IMAGE => {
-                let op = OpTypeImage::try_from(instr)?;
-                let img_ty = if op.dim == Dim::DimSubpassData {
-                    Type::SubpassData
-                } else {
-                    // Only unit types allowed to be stored in storage images can
-                    // have given format.
-                    let unit_fmt = ImageUnitFormat::from_spv_def(op.is_sampled, op.is_depth, op.color_fmt)?;
-                    let arng = ImageArrangement::from_spv_def(op.dim, op.is_array, op.is_multisampled)?;
-                    let img_ty = ImageType::new(unit_fmt, arng);
-                    Type::Image(img_ty)
-                };
-                (op.ty_id, img_ty)
-            },
-            OP_TYPE_SAMPLED_IMAGE => {
-                let op = OpTypeSampledImage::try_from(instr)?;
-                if let Some(Type::Image(img_ty)) = self.ty_map.get(&op.img_ty_id) {
-                    (op.ty_id, Type::Image(img_ty.clone()))
-                } else { return Err(Error::TY_NOT_FOUND); }
-            },
-            OP_TYPE_ARRAY => {
-                let op = OpTypeArray::try_from(instr)?;
-                let proto_ty = self.ty_map.get(&op.proto_ty_id)
-                    .ok_or(Error::TY_NOT_FOUND)?;
-                let nrepeat = self.const_map.get(&op.nrepeat_const_id)
-                    .and_then(|constant| {
-                        if let Some(Type::Scalar(scalar_ty)) = self.ty_map.get(&constant.ty) {
-                            if scalar_ty.nbyte() == 4 && scalar_ty.is_uint() {
-                                return Some(constant.value[0]);
-                            }
-                        }
-                        None
-                    })
-                    .ok_or(Error::CONST_NOT_FOUND)?;
-                let stride = self.get_deco_u32(op.ty_id, None, Decoration::ArrayStride)
-                    .map(|x| x as usize);
-                let arr_ty = if let Some(stride) = stride {
-                    ArrayType::new(proto_ty, nrepeat, stride)
-                } else {
-                    ArrayType::new_multibind(proto_ty, nrepeat)
-                };
-                (op.ty_id, Type::Array(arr_ty))
-            },
-            OP_TYPE_RUNTIME_ARRAY => {
-                let op = OpTypeRuntimeArray::try_from(instr)?;
-                let proto_ty = self.ty_map.get(&op.proto_ty_id)
-                    .ok_or(Error::TY_NOT_FOUND)?;
-                let stride = self.get_deco_u32(op.ty_id, None, Decoration::ArrayStride)
-                    .map(|x| x as usize)
-                    .ok_or(Error::MISSING_DECO)?;
-                let arr_ty = ArrayType::new_unsized(proto_ty, stride);
-                (op.ty_id, Type::Array(arr_ty))
-            }
+            OP_TYPE_VOID | OP_TYPE_FUNCTION => return Ok(()),
+            OP_TYPE_BOOL => self.populate_bool_ty(instr)?,
+            OP_TYPE_INT => self.populate_int_ty(instr)?,
+            OP_TYPE_FLOAT => self.populate_float_ty(instr)?,
+            OP_TYPE_VECTOR => self.populate_vec_ty(instr)?,
+            OP_TYPE_MATRIX => self.populate_mat_ty(instr)?,
+            OP_TYPE_IMAGE => self.populate_img_ty(instr)?,
+            OP_TYPE_SAMPLED_IMAGE => self.populate_sampled_img_ty(instr)?,
+            OP_TYPE_ARRAY => self.populate_arr_ty(instr)?,
+            OP_TYPE_RUNTIME_ARRAY => self.populate_rt_arr_ty(instr)?,
             OP_TYPE_STRUCT => {
-                let op = OpTypeStruct::try_from(instr)?;
-                let mut struct_ty = StructType::default();
-                for (i, &member_ty_id) in op.member_ty_ids.iter().enumerate() {
-                    let i = i as u32;
-                    let mut member_ty = self.ty_map.get(&member_ty_id)
-                        .cloned()
-                        .ok_or(Error::TY_NOT_FOUND)?;
-                    let mut proto_ty = &mut member_ty;
-                    while let Type::Array(arr_ty) = proto_ty {
-                        proto_ty = &mut *arr_ty.proto_ty;
-                    }
-                    if let Type::Matrix(ref mut mat_ty) = proto_ty {
-                        let mat_stride = self.get_deco_u32(op.ty_id, Some(i), Decoration::MatrixStride)
-                            .map(|x| x as usize)
-                            .ok_or(Error::MISSING_DECO)?;
-                        let row_major = self.contains_deco(op.ty_id, Some(i), Decoration::RowMajor);
-                        let col_major = self.contains_deco(op.ty_id, Some(i), Decoration::ColMajor);
-                        let major = match (row_major, col_major) {
-                            (true, false) => MatrixAxisOrder::RowMajor,
-                            (false, true) => MatrixAxisOrder::ColumnMajor,
-                            _ => return Err(Error::UNENCODED_ENUM),
-                        };
-                        mat_ty.decorate(mat_stride, major);
-                    }
-                    let name = if let Some(nm) = self.get_name(op.ty_id, Some(i)) {
-                        if nm.is_empty() { None } else { Some(nm.to_owned()) }
-                    } else { None };
-                    if let Some(offset) = self.get_deco_u32(op.ty_id, Some(i), Decoration::Offset)
-                        .map(|x| x as usize) {
-                        let member = StructMember { name, offset, ty: member_ty };
-                        struct_ty.push_member(member)?;
-                    } else {
-                        // For shader input/output blocks there are no offset
-                        // decoration. Since these variables are not externally
-                        // accessible we don't have to worry about them.
-                        return Ok(())
-                    }
-                }
-                // Don't have to shrink-to-fit because the types in `ty_map`
-                // won't be used directly and will be cloned later.
-                (op.ty_id, Type::Struct(struct_ty))
+                if let Some(x) = self.populate_struct_ty(instr)? {
+                    x
+                } else { return Ok(()) }
             },
             OP_TYPE_POINTER => {
                 let op = OpTypePointer::try_from(instr)?;
@@ -466,59 +505,67 @@ impl<'a> ReflectIntermediate<'a> {
             }
         }
     }
-    fn collect_fn_vars(&self, func: FunctionId) -> HashSet<VariableId> {
+    fn collect_fn_vars(&self, func_id: FunctionId) -> HashSet<VariableId> {
         let mut accessed_vars = HashSet::new();
-        self.collect_fn_vars_impl(func, &mut accessed_vars);
+        self.collect_fn_vars_impl(func_id, &mut accessed_vars);
         accessed_vars
+    }
+    fn collect_accessed_vars(&self, func_id: FunctionId) -> Result<Manifest> {
+        let mut manifest = Manifest::default();
+        let accessed_var_ids = self.collect_fn_vars(func_id);
+        for accessed_var_id in accessed_var_ids {
+            let accessed_var = self.var_map.get(&accessed_var_id)
+                .cloned()
+                .ok_or(Error::UNDECLARED_VAR)?;
+            match accessed_var {
+                Variable::Input(location, ivar_ty) => {
+                    // TODO: Input variables can share locations (aliasing).
+                    manifest.input_map.insert(location, ivar_ty);
+                    if let Some(name) = self.get_name(accessed_var_id, None) {
+                        let name = name.to_owned();
+                        let locator = ResourceLocator::Input(location);
+                        if manifest.var_name_map.insert(name, locator).is_some() {
+                            return Err(Error::NAME_COLLISION);
+                        }
+                    }
+                },
+                Variable::Output(location, ivar_ty) => {
+                    // TODO: Output variables can share locations (aliasing).
+                    manifest.output_map.insert(location, ivar_ty);
+                    if let Some(name) = self.get_name(accessed_var_id, None) {
+                        let name = name.to_owned();
+                        let locator = ResourceLocator::Output(location);
+                        if manifest.var_name_map.insert(name, locator).is_some() {
+                            return Err(Error::NAME_COLLISION);
+                        }
+                    }
+                },
+                Variable::Descriptor(desc_bind, desc_ty) => {
+                    // Descriptors cannot share bindings.
+                    if manifest.desc_map.insert(desc_bind, desc_ty).is_some() {
+                        return Err(Error::DESC_BIND_COLLISION);
+                    }
+                    if let Some(name) = self.get_name(accessed_var_id, None) {
+                        let name = name.to_owned();
+                        let locator = ResourceLocator::Descriptor(desc_bind);
+                        if manifest.var_name_map.insert(name, locator).is_some() {
+                            return Err(Error::NAME_COLLISION);
+                        }
+                    }
+                },
+            };
+        }
+        Ok(manifest)
     }
     fn collect_entry_points(&self) -> Result<Box<[EntryPoint]>> {
         let mut entry_points = Vec::with_capacity(self.entry_point_declrs.len());
         for entry_point_declr in self.entry_point_declrs.iter() {
-            let mut entry_point = EntryPoint {
+            let manifest = self.collect_accessed_vars(entry_point_declr.func_id)?;
+            let entry_point = EntryPoint {
                 name: entry_point_declr.name.to_owned(),
                 exec_model: entry_point_declr.exec_model,
-                manifest: Manifest::default(),
+                manifest,
             };
-            let accessed_var_ids = self.collect_fn_vars(entry_point_declr.func_id);
-            for accessed_var_id in accessed_var_ids {
-                let accessed_var = self.var_map.get(&accessed_var_id)
-                    .cloned()
-                    .ok_or(Error::UNDECLARED_VAR)?;
-                match accessed_var {
-                    Variable::Input(location, ivar_ty) => {
-                        // Input variables can share locations (aliasing).
-                        entry_point.manifest.input_map.insert(location, ivar_ty);
-                        if let Some(name) = self.get_name(accessed_var_id, None) {
-                            if entry_point.manifest.var_name_map
-                                .insert(name.to_owned(), ResourceLocator::Input(location)).is_some() {
-                                return Err(Error::NAME_COLLISION);
-                            }
-                        }
-                    },
-                    Variable::Output(location, ivar_ty) => {
-                        // Output variables can share locations (aliasing).
-                        entry_point.manifest.output_map.insert(location, ivar_ty);
-                        if let Some(name) = self.get_name(accessed_var_id, None) {
-                            if entry_point.manifest.var_name_map
-                                .insert(name.to_owned(), ResourceLocator::Output(location)).is_some() {
-                                return Err(Error::NAME_COLLISION);
-                            }
-                        }
-                    },
-                    Variable::Descriptor(desc_bind, desc_ty) => {
-                        // Descriptors cannot share bindings.
-                        if entry_point.manifest.desc_map.insert(desc_bind, desc_ty).is_some() {
-                            return Err(Error::DESC_BIND_COLLISION);
-                        }
-                        if let Some(name) = self.get_name(accessed_var_id, None) {
-                            if entry_point.manifest.var_name_map
-                                .insert(name.to_owned(), ResourceLocator::Descriptor(desc_bind)).is_some() {
-                                return Err(Error::NAME_COLLISION);
-                            }
-                        }
-                    },
-                };
-            }
             entry_points.push(entry_point);
         }
         Ok(entry_points.into_boxed_slice())
