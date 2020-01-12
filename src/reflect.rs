@@ -73,10 +73,8 @@ impl<'a> ReflectIntermediate<'a> {
             .and_then(|x| x.get(0))
             .cloned()
     }
-    fn get_var_location_or_default(&self, var_id: VariableId) -> Location {
-        self.get_deco_u32(var_id, None, Decoration::Location)
-            .unwrap_or(0)
-            .into()
+    fn get_var_location(&self, var_id: VariableId) -> Option<Location> {
+        self.get_deco_u32(var_id, None, Decoration::Location).map(Into::into)
     }
     fn get_var_component_or_default(&self, var_id: VariableId) -> Component {
         self.get_deco_u32(var_id, None, Decoration::Component)
@@ -332,22 +330,26 @@ impl<'a> ReflectIntermediate<'a> {
         };
         match op.store_cls {
             StorageClass::Input => {
-                let location = self.get_var_location_or_default(op.alloc_id);
-                let component = self.get_var_component_or_default(op.alloc_id);
-                let var = Variable::Input(location, component, ty.clone());
-                if self.var_map.insert(op.alloc_id, var).is_some() {
-                    return Err(Error::ID_COLLISION);
+                // TODO: Handle inputs like gl_VertexIndex that do not have a location.
+                if let Some(location) = self.get_var_location(op.alloc_id) {
+                    let component = self.get_var_component_or_default(op.alloc_id);
+                    let var = Variable::Input(location, component, ty.clone());
+                    if self.var_map.insert(op.alloc_id, var).is_some() {
+                        return Err(Error::ID_COLLISION);
+                    }
+                    // There can be interface blocks for input and output but there
+                    // won't be any for attribute inputs nor for attachment outputs,
+                    // so we just ignore structs and arrays or something else here.
                 }
-                // There can be interface blocks for input and output but there
-                // won't be any for attribute inputs nor for attachment outputs,
-                // so we just ignore structs and arrays or something else here.
             },
             StorageClass::Output => {
-                let location = self.get_var_location_or_default(op.alloc_id);
-                let component = self.get_var_component_or_default(op.alloc_id);
-                let var = Variable::Output(location, component, ty.clone());
-                if self.var_map.insert(op.alloc_id, var).is_some() {
-                    return Err(Error::ID_COLLISION);
+                // TODO: Handle outputs that do not have a location
+                if let Some(location) = self.get_var_location(op.alloc_id) {
+                    let component = self.get_var_component_or_default(op.alloc_id);
+                    let var = Variable::Output(location, component, ty.clone());
+                    if self.var_map.insert(op.alloc_id, var).is_some() {
+                        return Err(Error::ID_COLLISION);
+                    }
                 }
             },
             StorageClass::PushConstant => {
